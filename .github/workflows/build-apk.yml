@@ -54,6 +54,23 @@ jobs:
           grep -Eq '^p4a\.branch[[:space:]]*=[[:space:]]*v2024\.01\.21$' buildozer.spec
           python -m compileall -q main.py entities.py maze_generator.py p4a-recipes
 
+      - name: Smoke Test Android Startup Path
+        env:
+          ANDROID_ARGUMENT: /tmp
+          SDL_AUDIODRIVER: dummy
+          SDL_VIDEODRIVER: dummy
+        run: |
+          python - <<'PY'
+          import pygame
+          from main import DungeonGame
+
+          game = DungeonGame()
+          assert game.is_android, "Android display path was not selected"
+          game.render()
+          assert all(dimension > 0 for dimension in game.screen.get_size())
+          pygame.quit()
+          PY
+
       - name: Build Android Debug APK
         shell: bash
         run: |

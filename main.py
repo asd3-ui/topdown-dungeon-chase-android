@@ -139,15 +139,29 @@ class DungeonGame:
     """
 
     def __init__(self):
-        pygame.init()
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
+        pygame.display.init()
+        display_driver = pygame.display.get_driver().lower()
+        self.is_android = (
+            sys.platform == "android"
+            or bool(os.environ.get("ANDROID_ARGUMENT"))
+            or display_driver == "android"
+        )
+
+        if self.is_android:
+            try:
+                self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            except pygame.error:
+                self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        else:
+            self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
+
         pygame.display.set_caption("Top-Down Dungeon Chase")
         self.clock = pygame.time.Clock()
 
         self.state: int = STATE_MENU
         self.highscores = HighScoreManager()
         self.audio = SoundSynthesizer()
-        self.joystick = VirtualJoystick(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.joystick = VirtualJoystick(*self.screen.get_size())
 
         self.difficulty: str = "NORMAL"
         self.camera_x: float = 0.0
@@ -176,8 +190,15 @@ class DungeonGame:
                 return False
 
             elif event.type == pygame.VIDEORESIZE:
-                w, h = event.w, event.h
-                self.screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+                if self.is_android:
+                    surface = pygame.display.get_surface()
+                    if surface is not None:
+                        self.screen = surface
+                    w, h = self.screen.get_size()
+                else:
+                    w, h = max(1, event.w), max(1, event.h)
+                    self.screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+
                 self.joystick.resize(w, h)
 
             elif event.type == pygame.KEYDOWN:
