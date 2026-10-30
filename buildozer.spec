@@ -1,12 +1,12 @@
 [app]
-title = Top-Down Dungeon Chase
-package.name = topdowndungeon
-package.domain = org.dungeon.chase
+title = Dungeon Raycast 3D Advanced
+package.name = dungeonraycast3d
+package.domain = org.dungeon.game
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,wav,ogg,ttf
 version = 1.0.0
-requirements = python3,pygame==2.6.1
-orientation = portrait
+requirements = python3,kivy==2.3.0,pygame==2.5.2,pyjnius
+orientation = landscape
 fullscreen = 1
 permissions = INTERNET, VIBRATE
 android.api = 33
