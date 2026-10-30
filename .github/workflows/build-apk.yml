@@ -35,7 +35,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git zip unzip autoconf automake libtool pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake \
-            libffi-dev libssl-dev build-essential ccache \
+            libffi-dev libssl-dev build-essential ccache binutils \
             libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev \
             libportmidi-dev libswscale-dev libavformat-dev libavcodec-dev
 
@@ -57,15 +57,19 @@ jobs:
       - name: Smoke Test Android Startup Path
         env:
           ANDROID_ARGUMENT: /tmp
+          ANDROID_PRIVATE: /tmp
           SDL_AUDIODRIVER: dummy
           SDL_VIDEODRIVER: dummy
         run: |
           python - <<'PY'
           import pygame
-          from main import DungeonGame
+          from main import DungeonGame, STATE_PLAYING
 
           game = DungeonGame()
           assert game.is_android, "Android display path was not selected"
+          game.render()
+          game.state = STATE_PLAYING
+          game.update(0.016)
           game.render()
           assert all(dimension > 0 for dimension in game.screen.get_size())
           pygame.quit()
@@ -76,6 +80,25 @@ jobs:
         run: |
           set -o pipefail
           buildozer android debug 2>&1 | tee buildozer-build.log
+
+      - name: Verify APK Native Libraries & Zero Missing SIMD Symbols
+        run: |
+          mkdir -p /tmp/verify-apk
+          APK_PATH=$(find bin/ -name "*.apk" | head -n 1)
+          test -n "$APK_PATH"
+          unzip -q "$APK_PATH" -d /tmp/verify-apk
+          for ARCH in arm64-v8a armeabi-v7a; do
+            mkdir -p "/tmp/verify-apk/bundle-$ARCH"
+            tar -xf "/tmp/verify-apk/lib/$ARCH/libpybundle.so" -C "/tmp/verify-apk/bundle-$ARCH"
+            SURFACE_SO="/tmp/verify-apk/bundle-$ARCH/_python_bundle/site-packages/pygame/surface.so"
+            test -f "$SURFACE_SO"
+            echo "Checking $ARCH surface.so for undefined SIMD blitter symbols..."
+            if readelf -sDW "$SURFACE_SO" | grep -E 'UND.*(sse2|avx2|neon|blit_blend|alphablit|premul)'; then
+              echo "ERROR: Undefined SIMD blitter symbols found in $ARCH surface.so!"
+              exit 1
+            fi
+            echo "$ARCH surface.so passed symbol verification!"
+          done
 
       - name: Locate and Stage APK
         id: stage_apk

@@ -3,7 +3,9 @@ main.py - Top-Down Dungeon Chase Game Engine
 Optimized for mobile Android deployment via Buildozer and Pygame.
 Features 20x20 top-down dungeon rendering, smooth follow camera, tactical overview mode,
 30-frame cached A* chasing shadow beast, multi-touch virtual analog joystick,
-Android Back Button (K_AC_BACK) intercepting, and local JSON high-score persistence.
+on-screen mobile HUD buttons (Pause, Map View, Difficulty),
+Android Back Button (K_AC_BACK) & lifecycle event handling,
+and writable Android app storage for JSON high-score persistence.
 STRICTLY ZERO FONT CALLS - No pygame.font.SysFont to prevent Android launch crash.
 """
 
@@ -12,6 +14,7 @@ import os
 import math
 import json
 import time
+import traceback
 from typing import List, Dict, Any, Tuple, Optional
 import pygame
 
@@ -45,18 +48,36 @@ STATE_PAUSED: int = 2
 STATE_GAMEOVER: int = 3
 STATE_VICTORY: int = 4
 
-# High scores file path
-HIGHSCORE_FILE: str = "highscores.json"
+# High scores filename
+HIGHSCORE_FILENAME: str = "highscores.json"
 
 # Android Back Key code fallback
-K_AC_BACK = getattr(pygame, 'K_AC_BACK', 1073742094)
+K_AC_BACK = getattr(pygame, "K_AC_BACK", 1073742094)
+
+# SDL2 mobile lifecycle events (safe getattr fallbacks)
+APP_WILLENTERBACKGROUND = getattr(pygame, "APP_WILLENTERBACKGROUND", 259)
+APP_DIDENTERBACKGROUND = getattr(pygame, "APP_DIDENTERBACKGROUND", 260)
+APP_WILLENTERFOREGROUND = getattr(pygame, "APP_WILLENTERFOREGROUND", 261)
+APP_DIDENTERFOREGROUND = getattr(pygame, "APP_DIDENTERFOREGROUND", 262)
+
+
+def get_writable_data_path(filename: str) -> str:
+    """Returns a guaranteed writable file path on both Android and desktop."""
+    base_dir = (
+        os.environ.get("ANDROID_PRIVATE")
+        or os.environ.get("ANDROID_ARGUMENT")
+        or os.path.expanduser("~")
+    )
+    if base_dir and os.path.isdir(base_dir) and os.access(base_dir, os.W_OK):
+        return os.path.join(base_dir, filename)
+    return filename
 
 
 class HighScoreManager:
-    """Manages local JSON-based persistent high scores."""
+    """Manages local JSON-based persistent high scores in writable storage."""
 
-    def __init__(self, filepath: str = HIGHSCORE_FILE):
-        self.filepath = filepath
+    def __init__(self, filename: str = HIGHSCORE_FILENAME):
+        self.filepath = get_writable_data_path(filename)
         self.data: Dict[str, Any] = {"best_score": 0, "best_time": 0.0, "total_escapes": 0}
         self.load()
 
@@ -64,7 +85,9 @@ class HighScoreManager:
         if os.path.exists(self.filepath):
             try:
                 with open(self.filepath, "r", encoding="utf-8") as f:
-                    self.data = json.load(f)
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        self.data.update(loaded)
             except Exception:
                 pass
 
@@ -90,12 +113,15 @@ class HighScoreManager:
 
 class SoundSynthesizer:
     """
-    Lightweight procedural audio effects using numpy/pygame mixer buffers.
-    Safely degrades gracefully if audio hardware is unavailable on mobile.
+    Lightweight procedural audio effects using pure Python PCM byte buffers.
+    Does not require numpy and safely degrades if audio hardware is unavailable.
     """
 
     def __init__(self):
         self.enabled = False
+        self.heartbeat_sound: Optional[pygame.mixer.Sound] = None
+        self.key_sound: Optional[pygame.mixer.Sound] = None
+        self.alert_sound: Optional[pygame.mixer.Sound] = None
         try:
             pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
             self.enabled = True
@@ -109,33 +135,46 @@ class SoundSynthesizer:
         if not self.enabled:
             return None
         try:
-            import numpy as np
+            import array
             sample_rate = 22050
             n_samples = int(sample_rate * duration)
-            t = np.linspace(0, duration, n_samples, False)
-            waveform = np.sin(2 * np.pi * freq * t) * (np.exp(-3.0 * t))
-            waveform = (waveform * 32767 * volume).astype(np.int16)
-            return pygame.sndarray.make_sound(waveform)
+            buf = array.array("h")
+            for i in range(n_samples):
+                t = i / float(sample_rate)
+                sample = math.sin(2.0 * math.pi * freq * t) * math.exp(-3.0 * t)
+                val = int(max(-32767.0, min(32767.0, sample * 32767.0 * volume)))
+                buf.append(val)
+            return pygame.mixer.Sound(buffer=buf.tobytes())
         except Exception:
             return None
 
     def play_heartbeat(self):
         if self.enabled and self.heartbeat_sound:
-            self.heartbeat_sound.play()
+            try:
+                self.heartbeat_sound.play()
+            except Exception:
+                pass
 
     def play_key(self):
         if self.enabled and self.key_sound:
-            self.key_sound.play()
+            try:
+                self.key_sound.play()
+            except Exception:
+                pass
 
     def play_alert(self):
         if self.enabled and self.alert_sound:
-            self.alert_sound.play()
+            try:
+                self.alert_sound.play()
+            except Exception:
+                pass
 
 
 class DungeonGame:
     """
     Main Game Controller & Top-Down Renderer.
-    Features follow camera, 360-degree analog touch joystick, vector HUD, and persistence.
+    Features follow camera, 360-degree analog touch joystick, touch HUD buttons,
+    vector HUD, and persistence.
     """
 
     def __init__(self):
@@ -144,31 +183,56 @@ class DungeonGame:
         self.is_android = (
             sys.platform == "android"
             or bool(os.environ.get("ANDROID_ARGUMENT"))
+            or bool(os.environ.get("ANDROID_PRIVATE"))
             or display_driver == "android"
         )
 
-        if self.is_android:
-            try:
-                self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-            except pygame.error:
-                self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-        else:
-            self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
-
+        self.screen = self._init_display_surface()
         pygame.display.set_caption("Top-Down Dungeon Chase")
         self.clock = pygame.time.Clock()
 
         self.state: int = STATE_MENU
         self.highscores = HighScoreManager()
         self.audio = SoundSynthesizer()
-        self.joystick = VirtualJoystick(*self.screen.get_size())
+        sw, sh = self.screen.get_size()
+        self.joystick = VirtualJoystick(sw, sh)
 
         self.difficulty: str = "NORMAL"
         self.camera_x: float = 0.0
         self.camera_y: float = 0.0
         self.full_map_mode: bool = False
-        self.heartbeat_timer = 0.0
+        self.heartbeat_timer: float = 0.0
+        self._update_ui_rects(sw, sh)
         self.init_game_session()
+
+    def _init_display_surface(self) -> pygame.Surface:
+        """Initializes the SDL2 window surface safely on Android and desktop."""
+        if self.is_android:
+            for mode_args in (
+                ((0, 0), pygame.FULLSCREEN),
+                ((0, 0), 0),
+                ((SCREEN_WIDTH, SCREEN_HEIGHT), 0),
+            ):
+                try:
+                    surf = pygame.display.set_mode(*mode_args)
+                    if surf is not None and surf.get_width() > 0 and surf.get_height() > 0:
+                        return surf
+                except Exception:
+                    continue
+        try:
+            return pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
+        except Exception:
+            return pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+
+    def _update_ui_rects(self, sw: int, sh: int) -> None:
+        """Computes touchable button rectangles for mobile and desktop."""
+        btn_w, btn_h = 240, 52
+        self.start_btn_rect = pygame.Rect(sw // 2 - btn_w // 2, sh // 2 - 10, btn_w, btn_h)
+        self.diff_btn_rect = pygame.Rect(sw // 2 - 150, sh // 2 + 82, 300, 38)
+
+        # In-game top-center / top-right touch controls (Pause & Map toggle)
+        self.pause_btn_rect = pygame.Rect(sw // 2 + 28, 12, 74, 34)
+        self.map_btn_rect = pygame.Rect(sw // 2 - 102, 12, 74, 34)
 
     def init_game_session(self) -> None:
         """Starts a fresh dungeon run with procedural maze and entities."""
@@ -182,12 +246,52 @@ class DungeonGame:
         self.camera_y = py * TILE_SIZE
         self.game_time: float = 0.0
         self.is_new_best: bool = False
+        self.joystick.touch_id = None
+        self.joystick.vx = 0.0
+        self.joystick.vy = 0.0
+        self.joystick.sprint_pressed = False
+
+    def _cycle_difficulty(self) -> None:
+        diffs = ["EASY", "NORMAL", "HARD"]
+        idx = (diffs.index(self.difficulty) + 1) % len(diffs)
+        self.difficulty = diffs[idx]
+
+    def _handle_pointer_tap(self, px: float, py: float) -> None:
+        """Handles tap interactions on Menu, Pause, GameOver, Victory, and HUD buttons."""
+        if self.state == STATE_MENU:
+            if self.diff_btn_rect.collidepoint(px, py):
+                self._cycle_difficulty()
+            else:
+                self.init_game_session()
+                self.state = STATE_PLAYING
+        elif self.state in (STATE_GAMEOVER, STATE_VICTORY):
+            self.init_game_session()
+            self.state = STATE_PLAYING
+        elif self.state == STATE_PAUSED:
+            if self.diff_btn_rect.collidepoint(px, py):
+                self._cycle_difficulty()
+            else:
+                self.state = STATE_PLAYING
 
     def handle_events(self) -> bool:
-        """Polls pygame events and handles Android Back Button."""
+        """Polls pygame events and handles Android Back Button, touch, and lifecycle."""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
+
+            elif event.type in (APP_WILLENTERBACKGROUND, APP_DIDENTERBACKGROUND):
+                if self.state == STATE_PLAYING:
+                    self.state = STATE_PAUSED
+                self.highscores.save()
+
+            elif event.type in (APP_WILLENTERFOREGROUND, APP_DIDENTERFOREGROUND):
+                surf = pygame.display.get_surface()
+                if surf is not None:
+                    self.screen = surf
+                    sw, sh = self.screen.get_size()
+                    if sw > 0 and sh > 0:
+                        self.joystick.resize(sw, sh)
+                        self._update_ui_rects(sw, sh)
 
             elif event.type == pygame.VIDEORESIZE:
                 if self.is_android:
@@ -199,7 +303,9 @@ class DungeonGame:
                     w, h = max(1, event.w), max(1, event.h)
                     self.screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
 
-                self.joystick.resize(w, h)
+                if w > 0 and h > 0:
+                    self.joystick.resize(w, h)
+                    self._update_ui_rects(w, h)
 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE or event.key == K_AC_BACK:
@@ -218,9 +324,7 @@ class DungeonGame:
                         self.state = STATE_PLAYING
 
                 elif event.key == pygame.K_d and self.state in (STATE_MENU, STATE_PAUSED):
-                    diffs = ["EASY", "NORMAL", "HARD"]
-                    idx = (diffs.index(self.difficulty) + 1) % len(diffs)
-                    self.difficulty = diffs[idx]
+                    self._cycle_difficulty()
 
                 elif event.key == pygame.K_m and self.state == STATE_PLAYING:
                     self.full_map_mode = not self.full_map_mode
@@ -229,28 +333,54 @@ class DungeonGame:
                     self.state = STATE_PAUSED
 
             elif event.type == pygame.FINGERDOWN:
+                sw, sh = self.screen.get_size()
+                px = event.x * sw if event.x <= 1.0 else event.x
+                py = event.y * sh if event.y <= 1.0 else event.y
                 if self.state == STATE_PLAYING:
-                    self.joystick.handle_touch_down(event.finger_id, event.x, event.y)
-                elif self.state in (STATE_MENU, STATE_GAMEOVER, STATE_VICTORY):
-                    self.init_game_session()
-                    self.state = STATE_PLAYING
-                elif self.state == STATE_PAUSED:
-                    self.state = STATE_PLAYING
+                    if self.pause_btn_rect.collidepoint(px, py):
+                        self.state = STATE_PAUSED
+                    elif self.map_btn_rect.collidepoint(px, py):
+                        self.full_map_mode = not self.full_map_mode
+                    else:
+                        norm_x = px / max(1, sw)
+                        norm_y = py / max(1, sh)
+                        self.joystick.handle_touch_down(event.finger_id, norm_x, norm_y)
+                else:
+                    self._handle_pointer_tap(px, py)
 
             elif event.type == pygame.FINGERMOTION:
                 if self.state == STATE_PLAYING:
-                    self.joystick.handle_touch_move(event.finger_id, event.x, event.y)
+                    sw, sh = self.screen.get_size()
+                    norm_x = event.x if event.x <= 1.0 else event.x / max(1, sw)
+                    norm_y = event.y if event.y <= 1.0 else event.y / max(1, sh)
+                    self.joystick.handle_touch_move(event.finger_id, norm_x, norm_y)
 
             elif event.type == pygame.FINGERUP:
                 if self.state == STATE_PLAYING:
                     self.joystick.handle_touch_up(event.finger_id)
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                if self.state in (STATE_MENU, STATE_GAMEOVER, STATE_VICTORY):
-                    self.init_game_session()
-                    self.state = STATE_PLAYING
-                elif self.state == STATE_PAUSED:
-                    self.state = STATE_PLAYING
+                mx, my = event.pos
+                if self.state == STATE_PLAYING:
+                    if self.pause_btn_rect.collidepoint(mx, my):
+                        self.state = STATE_PAUSED
+                    elif self.map_btn_rect.collidepoint(mx, my):
+                        self.full_map_mode = not self.full_map_mode
+                    elif not self.is_android:
+                        sw, sh = self.screen.get_size()
+                        self.joystick.handle_touch_down(-1, mx / max(1, sw), my / max(1, sh))
+                else:
+                    self._handle_pointer_tap(mx, my)
+
+            elif event.type == pygame.MOUSEMOTION and not self.is_android:
+                if self.state == STATE_PLAYING and self.joystick.touch_id == -1:
+                    mx, my = event.pos
+                    sw, sh = self.screen.get_size()
+                    self.joystick.handle_touch_move(-1, mx / max(1, sw), my / max(1, sh))
+
+            elif event.type == pygame.MOUSEBUTTONUP and not self.is_android:
+                if self.state == STATE_PLAYING:
+                    self.joystick.handle_touch_up(-1)
 
         return True
 
@@ -340,8 +470,13 @@ class DungeonGame:
                 overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
                 overlay.fill((0, 0, 0, 160))
                 surface.blit(overlay, (0, 0))
-                draw_vector_string(surface, "PAUSED", sw // 2 - 60, sh // 2 - 30, 20, 32, 6, (255, 200, 0), 3)
-                draw_vector_string(surface, "TAP OR PRESS SPACE TO RESUME", sw // 2 - 190, sh // 2 + 30, 10, 16, 4, (200, 200, 200), 2)
+                draw_vector_string(surface, "PAUSED", sw // 2 - 60, sh // 2 - 50, 20, 32, 6, (255, 200, 0), 3)
+                draw_vector_string(surface, "TAP SCREEN TO RESUME", sw // 2 - 140, sh // 2 + 10, 10, 16, 4, (220, 220, 220), 2)
+
+                diff_col = (50, 220, 120) if self.difficulty == "EASY" else ((255, 180, 0) if self.difficulty == "NORMAL" else (255, 60, 60))
+                pygame.draw.rect(surface, (20, 28, 42), self.diff_btn_rect, border_radius=6)
+                pygame.draw.rect(surface, diff_col, self.diff_btn_rect, 2, border_radius=6)
+                draw_vector_string(surface, f"DIFFICULTY: {self.difficulty}", self.diff_btn_rect.x + 35, self.diff_btn_rect.y + 11, 10, 16, 4, diff_col, 2)
 
         elif self.state == STATE_MENU:
             self._render_menu(surface, sw, sh)
@@ -404,7 +539,7 @@ class DungeonGame:
             ox = sw // 2 - int(self.camera_x)
             oy = sh // 2 - int(self.camera_y)
         else:
-            tile_s = int(min(sw, sh) / (GRID_WIDTH + 1))
+            tile_s = max(8, int(min(sw, sh) / (GRID_WIDTH + 1)))
             ox = (sw - GRID_WIDTH * tile_s) // 2
             oy = (sh - GRID_HEIGHT * tile_s) // 2
 
@@ -494,7 +629,7 @@ class DungeonGame:
         pygame.draw.line(surface, (255, 255, 255), (plx, ply), (int(plx + p_dx), int(ply + p_dy)), 3)
 
     def _render_hud(self, surface: pygame.Surface, sw: int, sh: int) -> None:
-        """Renders vector HP, Stamina, Keys, and Threat Proximity."""
+        """Renders vector HP, Stamina, Keys, Threat Proximity, and Touch Control Buttons."""
         # Health Bar
         draw_vector_icon(surface, "heart", 20, 20, 24, (255, 60, 60))
         draw_vector_bar(surface, 52, 22, 140, 18, self.player.health, self.player.max_health, (220, 40, 40))
@@ -513,6 +648,17 @@ class DungeonGame:
         threat_color = (255, 40, 40) if threat_dist < 4.0 else ((255, 140, 0) if threat_dist < 8.0 else (80, 80, 100))
         draw_vector_icon(surface, "skull", sw // 2 - 12, 18, 24, threat_color)
 
+        # Touch Map Toggle Button
+        map_bg = (16, 85, 105) if self.full_map_mode else (22, 30, 46)
+        pygame.draw.rect(surface, map_bg, self.map_btn_rect, border_radius=6)
+        pygame.draw.rect(surface, (6, 182, 212), self.map_btn_rect, 1, border_radius=6)
+        draw_vector_string(surface, "MAP", self.map_btn_rect.x + 16, self.map_btn_rect.y + 10, 9, 14, 4, (220, 245, 255), 2)
+
+        # Touch Pause Button
+        pygame.draw.rect(surface, (22, 30, 46), self.pause_btn_rect, border_radius=6)
+        pygame.draw.rect(surface, (140, 160, 190), self.pause_btn_rect, 1, border_radius=6)
+        draw_vector_string(surface, "II", self.pause_btn_rect.x + 28, self.pause_btn_rect.y + 10, 7, 14, 4, (255, 255, 255), 2)
+
     def _render_menu(self, surface: pygame.Surface, sw: int, sh: int) -> None:
         surface.fill((10, 12, 18))
         pygame.draw.rect(surface, (40, 50, 70), (16, 16, sw - 32, sh - 32), 2)
@@ -522,22 +668,21 @@ class DungeonGame:
         draw_vector_string(surface, "TOP DOWN DUNGEON CHASE", sw // 2 - 250, title_y, 16, 28, 5, (6, 182, 212), 3)
         draw_vector_string(surface, "ESCAPE THE LABYRINTH", sw // 2 - 140, title_y + 45, 10, 16, 4, (200, 200, 220), 2)
 
-        btn_w, btn_h = 240, 46
-        btn_x = sw // 2 - btn_w // 2
-        btn_y = sh // 2
-        pygame.draw.rect(surface, (20, 60, 80), (btn_x, btn_y, btn_w, btn_h), border_radius=8)
-        pygame.draw.rect(surface, (6, 182, 212), (btn_x, btn_y, btn_w, btn_h), 2, border_radius=8)
-        draw_vector_string(surface, "TAP TO START", btn_x + 36, btn_y + 12, 12, 20, 4, (255, 255, 255), 2)
+        pygame.draw.rect(surface, (20, 60, 80), self.start_btn_rect, border_radius=8)
+        pygame.draw.rect(surface, (6, 182, 212), self.start_btn_rect, 2, border_radius=8)
+        draw_vector_string(surface, "TAP TO START", self.start_btn_rect.x + 36, self.start_btn_rect.y + 15, 12, 20, 4, (255, 255, 255), 2)
 
         best_sc = self.highscores.data.get("best_score", 0)
-        draw_vector_string(surface, f"HIGH SCORE: {best_sc}", sw // 2 - 90, btn_y + 65, 10, 16, 4, (255, 215, 0), 2)
+        draw_vector_string(surface, f"HIGH SCORE: {best_sc}", sw // 2 - 90, self.start_btn_rect.bottom + 14, 10, 16, 4, (255, 215, 0), 2)
 
-        # Difficulty indicator badge
+        # Touchable Difficulty selector button
         diff_col = (50, 220, 120) if self.difficulty == "EASY" else ((255, 180, 0) if self.difficulty == "NORMAL" else (255, 60, 60))
-        draw_vector_string(surface, f"DIFFICULTY: {self.difficulty} (PRESS D)", sw // 2 - 160, btn_y + 95, 8, 14, 3, diff_col, 2)
+        pygame.draw.rect(surface, (18, 24, 36), self.diff_btn_rect, border_radius=6)
+        pygame.draw.rect(surface, diff_col, self.diff_btn_rect, 1, border_radius=6)
+        draw_vector_string(surface, f"DIFFICULTY: {self.difficulty}", self.diff_btn_rect.x + 42, self.diff_btn_rect.y + 11, 9, 15, 4, diff_col, 2)
 
         hint_y = sh - 45
-        draw_vector_string(surface, "WASD MOVE  SHIFT SPRINT  M MAP VIEW", sw // 2 - 190, hint_y, 8, 14, 3, (130, 140, 160), 1)
+        draw_vector_string(surface, "TOUCH JOYSTICK MOVE   BOLT SPRINT   MAP VIEW", sw // 2 - 230, hint_y, 8, 14, 3, (130, 140, 160), 1)
 
     def _render_gameover(self, surface: pygame.Surface, sw: int, sh: int) -> None:
         surface.fill((20, 8, 8))
@@ -573,9 +718,21 @@ class DungeonGame:
             self.render()
 
         pygame.quit()
-        sys.exit(0)
+
+
+def main() -> None:
+    try:
+        game = DungeonGame()
+        game.run()
+    except Exception as exc:
+        err_log = get_writable_data_path("crash.log")
+        try:
+            with open(err_log, "w", encoding="utf-8") as f:
+                traceback.print_exc(file=f)
+        except Exception:
+            pass
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    game = DungeonGame()
-    game.run()
+    main()
