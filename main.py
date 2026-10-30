@@ -1,3 +1,62 @@
+import sys
+import pygame
+from entities import PlayerTopDown, EnemyTopDown, VirtualJoystick
+from maze_generator import generate_maze
+
+def main():
+    pygame.init()
+    pygame.mixer.init()
+
+    # الحصول على دقة الشاشة الحالية للهاتف
+    info_object = pygame.display.Info()
+    screen_width = info_object.current_w if info_object.current_w > 0 else 800
+    screen_height = info_object.current_h if info_object.current_h > 0 else 480
+
+    screen = pygame.display.set_mode((screen_width, screen_height), pygame.FULLSCREEN | pygame.SCALED)
+    pygame.display.set_caption("Dungeon Raycast 3D")
+
+    clock = pygame.time.Clock()
+
+    # إنشاء المتاهة وتحديد الكائنات
+    maze = generate_maze(20, 20)
+    player = PlayerTopDown(x=2, y=2)
+    enemy = EnemyTopDown(x=18, y=18)
+    joystick = VirtualJoystick(x=100, y=screen_height - 100, radius=50)
+
+    running = True
+    while running:
+        dt = clock.tick(60) / 1000.0  # حساب Delta Time لمنع السرعة الزائدة على الأجهزة القوية
+
+        events = pygame.event.get()
+        for event in events:
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+
+            # التفاعل مع اللمس للـ Virtual Joystick
+            joystick.handle_event(event)
+
+        # تحديث حركة الكائنات
+        move_vector = joystick.get_output()
+        player.update(dt, move_vector, maze)
+        enemy.update(dt, player.get_position(), maze)
+
+        # الرسم والتحديث
+        screen.fill((10, 10, 15))
+        # رسم الخريطة والكائنات...
+        player.draw(screen)
+        enemy.draw(screen)
+        joystick.draw(screen)
+
+        pygame.display.flip()
+
+    pygame.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
 {
   "lockfileVersion": 2,
   "configVersion": 1,
