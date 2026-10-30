@@ -83,22 +83,45 @@ jobs:
 
       - name: Verify APK Native Libraries & Zero Missing SIMD Symbols
         run: |
-          mkdir -p /tmp/verify-apk
-          APK_PATH=$(find bin/ -name "*.apk" | head -n 1)
-          test -n "$APK_PATH"
-          unzip -q -o "$APK_PATH" -d /tmp/verify-apk || true
-          for ARCH in arm64-v8a armeabi-v7a; do
-            mkdir -p "/tmp/verify-apk/bundle-$ARCH"
-            tar -xf "/tmp/verify-apk/lib/$ARCH/libpybundle.so" -C "/tmp/verify-apk/bundle-$ARCH"
-            SURFACE_SO="/tmp/verify-apk/bundle-$ARCH/_python_bundle/site-packages/pygame/surface.so"
-            test -f "$SURFACE_SO"
-            echo "Checking $ARCH surface.so for undefined SIMD blitter symbols..."
-            if readelf -sDW "$SURFACE_SO" | grep -E 'UND.*(sse2|avx2|neon|blit_blend|alphablit|premul)'; then
-              echo "ERROR: Undefined SIMD blitter symbols found in $ARCH surface.so!"
-              exit 1
-            fi
-            echo "$ARCH surface.so passed symbol verification!"
-          done
+          python - <<'PY'
+          import glob, os, subprocess, tarfile, zipfile
+
+          apks = glob.glob("bin/*.apk")
+          assert apks, "No APK found in bin/"
+          apk_path = apks[0]
+          print("Inspecting APK:", apk_path)
+
+          os.makedirs("/tmp/verify-apk", exist_ok=True)
+          with zipfile.ZipFile(apk_path, "r") as zf:
+              for member in zf.namelist():
+                  if member.endswith("libpybundle.so") or member.startswith("lib/"):
+                      zf.extract(member, "/tmp/verify-apk")
+
+          for arch in ("arm64-v8a", "armeabi-v7a"):
+              bundle_path = f"/tmp/verify-apk/lib/{arch}/libpybundle.so"
+              assert os.path.exists(bundle_path), f"Missing {bundle_path}"
+              extract_dir = f"/tmp/verify-apk/bundle-{arch}"
+              os.makedirs(extract_dir, exist_ok=True)
+              with tarfile.open(bundle_path, "r") as tf:
+                  tf.extractall(extract_dir)
+
+              surface_so = f"{extract_dir}/_python_bundle/site-packages/pygame/surface.so"
+              assert os.path.exists(surface_so), f"Missing {surface_so}"
+              out = subprocess.check_output(["readelf", "-sDW", surface_so], text=True)
+              bad = []
+              for line in out.splitlines():
+                  parts = line.split()
+                  if len(parts) >= 8 and parts[6] == "UND":
+                      sym = parts[7]
+                      if any(k in sym for k in ("sse2", "avx2", "neon", "blit_blend", "alphablit", "premul")):
+                          bad.append(sym)
+              print(f"[{arch}] Undefined SIMD blitter symbols in surface.so:", len(bad))
+              assert not bad, f"Undefined SIMD symbols in {arch} surface.so: {bad}"
+
+              dyn = subprocess.check_output(["readelf", "-d", surface_so], text=True)
+              assert "libm.so" in dyn, f"Missing libm.so NEEDED in {arch} surface.so"
+              print(f"[{arch}] surface.so passed symbol and libm.so verification!")
+          PY
 
       - name: Locate and Stage APK
         id: stage_apk
