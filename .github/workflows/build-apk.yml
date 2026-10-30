@@ -105,8 +105,10 @@ jobs:
               with tarfile.open(bundle_path, "r") as tf:
                   tf.extractall(extract_dir)
 
-              surface_so = f"{extract_dir}/_python_bundle/site-packages/pygame/surface.so"
-              assert os.path.exists(surface_so), f"Missing {surface_so}"
+              matches = glob.glob(f"{extract_dir}/**/pygame/surface*.so", recursive=True)
+              assert matches, f"Missing pygame/surface*.so under {extract_dir}"
+              surface_so = matches[0]
+              print(f"[{arch}] Inspecting {surface_so}")
               out = subprocess.check_output(["readelf", "-sDW", surface_so], text=True)
               bad = []
               for line in out.splitlines():
